@@ -1,0 +1,308 @@
+import asyncio
+import os
+import httpx
+import logging 
+import statistics
+import time
+import csv
+import json
+
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
+from pathlib import Path
+from tqdm.auto import tqdm
+import pandas as pd
+from dotenv import load_dotenv
+from tenacity import retry, RetryCallState, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+from openai import AsyncOpenAI
+from openai import APIError, RateLimitError, APITimeoutError
+
+data_path = Path().resolve().parent / 'data'
+
+load_dotenv('config.env')
+
+# Логгер (в ноутбуке будет печатать в output)
+logger = logging.getLogger("llm_async")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(h)
+    
+@dataclass
+class LLMStats:
+    ok: int = 0
+    err: int = 0
+    rate_limit_429: int = 0
+    retries_total: int = 0
+    latencies: List[float] = field(default_factory=list)
+    def snapshot(self) -> dict:
+        p95 = None
+        if self.latencies:
+            xs = sorted(self.latencies)
+            p95 = xs[int(0.95 * (len(xs) - 1))]
+        return {
+            "ok": self.ok,
+            "err": self.err,
+            "429": self.rate_limit_429,
+            "retries_total": self.retries_total,
+            "mean_latency_s": (statistics.mean(self.latencies) if self.latencies else None),
+            "p95_latency_s": p95,
+        }
+def tenacity_before_sleep(stats: LLMStats):
+    """
+    Хук tenacity: вызывается перед тем как tenacity "уснёт" перед следующим ретраем.
+    Тут считаем ретраи и логируем причины (в т.ч. 429).
+    """
+    def _hook(retry_state: RetryCallState) -> None:
+        stats.retries_total += 1
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        attempt = retry_state.attempt_number
+        wait = retry_state.next_action.sleep if retry_state.next_action else None
+        if isinstance(exc, RateLimitError):
+            stats.rate_limit_429 += 1
+            logger.warning(f"Retry (attempt={attempt}) due to 429 RateLimitError; sleep={wait:.2f}s")
+        else:
+            logger.warning(f"Retry (attempt={attempt}) due to {type(exc).__name__ if exc else 'Unknown'}; sleep={wait:.2f}s")
+    return _hook
+@dataclass(frozen=True)
+class NotebookConfig:
+    input_csv: str
+    output_csv: str
+    text_col: str = "text"
+    topic_col: str = "topic"
+    encoding: str = "cp1251"
+    sep: str = ","
+    # id_col — колонка с идентификатором. Если её нет в данных, мы создадим.
+    id_col: str = "HISTORYID"
+    result_col: str = "llm_result"
+    model: str = "your-model-name"
+    # Если у тебя openai-compatible endpoint:
+    base_url: Optional[str] = os.getenv("BASE_URL")
+    api_key: str = os.getenv("API_KEY", "")
+    # Параллелизм / чтение чанками:
+    concurrency: int = 20
+    chunksize: int = 500
+    # Ретраи:
+    max_retries: int = 6
+    temperature: float = 0.2
+
+ def make_client(cfg: NotebookConfig) -> AsyncOpenAI:
+    """
+    Создаем async-клиент openai SDK.
+    base_url нужен, если у тебя свой gateway/proxy/LLM endpoint (openai-compatible).
+    """
+    httpx_client = httpx.AsyncClient(
+        http2=True,
+        verify=False,
+        timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=30.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    if not cfg.api_key:
+        raise ValueError("API key пустой. Задай _API_KEY или передай в cfg.api_key")
+    return AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url, http_client=httpx_client) 
+  
+  def request_retry_decorator(max_retries: int, stats: LLMStats):
+    return retry(
+        reraise=True,
+        stop=stop_after_attempt(max_retries),
+        wait=wait_exponential_jitter(initial=1, max=30),
+        retry=retry_if_exception_type((RateLimitError, APIError, APITimeoutError, asyncio.TimeoutError)),
+        before_sleep=tenacity_before_sleep(stats),
+    )
+
+  async def llm_call_text(
+    client: AsyncOpenAI, 
+    cfg: NotebookConfig, 
+    meeting_note: str, 
+    meeting_topic: str,
+    
+) -> str:
+    """
+    ОДИН запрос к LLM.
+    Асинхронность: await освобождает event loop, пока идет HTTP запрос.
+    """
+    input_obj = {
+        "meeting_topic": meeting_topic,
+        "meeting_note": meeting_note,
+        # "taxonomy_json": taxonomy_json
+    }
+        
+    SYSTEM = ''
+
+  INSTRUCTIONS = ''
+  resp = await client.chat.completions.create(
+        model=cfg.model,
+        temperature=cfg.temperature,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "developer", "content": INSTRUCTIONS}, 
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": json.dumps(input_obj, ensure_ascii=False)},
+        ],
+    )
+    # Берем текст ответа
+    content = resp.choices[0].message.content
+    return content or ""
+
+def load_processed_ids(output_csv: str, id_col: str) -> set[Any]:
+    """
+    Resume-логика: читаем из output уже обработанные id.
+    Тогда при повторном запуске не будем повторно запрашивать LLM для этих строк.
+    """
+    if not os.path.exists(output_csv):
+        return set()
+    try:
+        ids = pd.read_csv(output_csv, usecols=[id_col])[id_col].dropna().unique().tolist()
+        return set(ids)
+    except Exception:
+        # Если файл испорчен/другая схема — resume не сработает, но пайплайн не упадет.
+        return set()
+async def process_chunk(
+    client: AsyncOpenAI,
+    cfg: NotebookConfig,
+    chunk: pd.DataFrame,
+    processed_ids: set[Any],
+    stats: LLMStats,
+    pbar: Optional[tqdm] = None,
+) -> pd.DataFrame:
+    """
+    Обрабатываем один pandas-chunk.
+    Ключевая идея:
+    - создаем много async-задач (по одной на строку)
+    - ограничиваем параллелизм через Semaphore
+    - запускаем все задачи разом через asyncio.gather()
+    Почему так:
+    - LLM API вызов — I/O-bound (HTTP), async дает большой выигрыш по throughput.
+    """
+    # Ограничение параллельных запросов (например 20 одновременных)
+    sem = asyncio.Semaphore(cfg.concurrency)
+    retry_call = request_retry_decorator(cfg.max_retries, stats)   
+    async def one(row_id: Any, text: Any, topic: Any) -> tuple[Any, str]:
+        """
+        Обработка одной строки:
+        - если уже обработана (row_id в processed_ids) => пропускаем
+        - если текст пустой => пропускаем
+        - иначе делаем запрос к LLM с ретраями
+        """
+        if row_id in processed_ids:
+            return row_id, ""  # маркер "не обновлять"
+        if not isinstance(text, str) or not text.strip() or not isinstance(topic, str) or not topic.strip():
+            return row_id, ""
+        # Semaphore гарантирует, что одновременно выполняются максимум cfg.concurrency запросов
+        # Semaphore гарантирует, что одновременно выполняются максимум cfg.concurrency запросов
+        async with sem:
+            @retry_call
+            async def _do() -> str:
+                t0 = time.perf_counter()
+                out = await llm_call_text(
+                    client, 
+                    cfg, 
+                    meeting_note=text, 
+                    meeting_topic=topic,  
+                    
+                )
+                stats.latencies.append(time.perf_counter() - t0)
+                return out
+            try:
+                result = await _do()
+                stats.ok += 1
+            except Exception as e:
+                # Важно: не валим весь job из-за одной строки
+                stats.err += 1
+                result = f"__ERROR__: {type(e).__name__}: {e}"
+            return row_id, result
+  # Создаем список задач. Каждая задача — coroutine one(...)
+    tasks = [
+        asyncio.create_task(one(rid, txt, topic))
+        for rid, txt, topic in zip(
+            chunk[cfg.id_col].tolist(), 
+            chunk[cfg.text_col].tolist(), 
+            chunk[cfg.topic_col].tolist(),
+
+        )
+    ]
+# Запускаем все задачи параллельно (в рамках семафора)
+    results: list[tuple[Any, str]] = []
+    # Склеиваем результаты обратно в DataFrame
+    for coro in asyncio.as_completed(tasks):
+        res = await coro
+        results.append(res)
+        if pbar is not None:
+            pbar.update(1)
+            
+    out = chunk.copy()
+    mapping = {rid: res for rid, res in results if res != ""}
+    # Если res == "" (пропуск) — оставим пусто
+    out[cfg.result_col] = out[cfg.id_col].map(mapping).fillna("")
+    return out
+
+def count_rows_fast(csv_path: str) -> int:
+    # -1 потому что header
+    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+        return max(0, sum(1 for _ in f) - 1)
+    
+def count_csv_records(csv_path: str, delimiter: str = ",", encoding: str = "utf-8") -> int:
+    with open(csv_path, "r", encoding=encoding, errors="replace", newline="") as f:
+        r = csv.reader(f, delimiter=delimiter)
+        next(r, None)  # header
+        return sum(1 for _ in r)
+
+async def run_job(cfg: NotebookConfig) -> None:
+    """
+    Главный pipeline, запускаемый в ноутбуке через: await run_job(cfg)
+    Что делает:
+    1) читает уже обработанные ids из output (resume)
+    2) читает input CSV чанками
+    3) гарантирует наличие стабильного id_col
+    4) async-обрабатывает chunk
+    5) дописывает результат в output CSV
+    """
+    stats = LLMStats()
+    client = make_client(cfg)
+    processed_ids = load_processed_ids(cfg.output_csv, cfg.id_col)
+    write_header = not os.path.exists(cfg.output_csv)
+    # IMPORTANT про id:
+    # - если в твоих данных id_col нет, мы создаем row_id как 0..N-1 (по порядку строк в файле)
+    # - это будет стабильным идентификатором при условии, что исходный CSV не меняет порядок строк
+    global_row_offset = 0
+
+    total_rows = count_csv_records(cfg.input_csv, delimiter=cfg.sep)
+    # общий прогресс: сколько строк реально потребует обработки
+    # (приблизительно: total_rows - len(processed_ids), но processed_ids может быть 0 если output пуст)
+    to_process_est = max(0, total_rows - len(processed_ids))
+    # один общий прогресс-бар на весь job
+    with tqdm(total=to_process_est, desc="LLM rows", unit="row") as pbar:
+        try:
+            for chunk in pd.read_csv(cfg.input_csv, chunksize=cfg.chunksize, encoding=cfg.encoding, sep=cfg.sep):
+                chunk.fillna(value={cfg.text_col : "", cfg.topic_col : ""}, inplace=True)
+                # Создаем row_id, если нет в данных
+                if cfg.id_col not in chunk.columns:
+                    chunk.insert(0, cfg.id_col, range(global_row_offset, global_row_offset + len(chunk)))
+                global_row_offset += len(chunk)
+                if cfg.text_col not in chunk.columns:
+                    raise ValueError(f"Column '{cfg.text_col}' not found in CSV")
+                processed_chunk = await process_chunk(client, cfg, chunk, processed_ids, stats=stats, pbar=pbar)
+                # append в output
+                processed_chunk.to_csv(cfg.output_csv, mode="a", header=write_header, index=False, sep=cfg.sep)
+                write_header = False
+                # обновим processed_ids, чтобы не дублировать запросы в текущем запуске
+                processed_ids.update(processed_chunk[cfg.id_col].dropna().tolist())
+                logger.info(f"Stats: {stats.snapshot()}")
+        finally:
+            await client.close()
+    
+cfg = NotebookConfig(
+    input_csv=data_path / 'preprocessed' / "sampled_to_assess.csv",
+    output_csv=data_path / 'preprocessed' / "sampled_to_assess_with_qwen2.csv",
+    text_col="Описание встречи",
+    topic_col="Тема встречи",
+    model="PNX.QWEN3 235b a22b instruct",
+    encoding='utf-8',
+    sep=';',
+    base_url=os.getenv("BASE_URL"),  # если нужно
+    api_key=os.getenv("API_KEY"),
+    concurrency=5,
+    chunksize=100,
+)
+await run_job(cfg)
